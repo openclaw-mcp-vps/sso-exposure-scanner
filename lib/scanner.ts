@@ -1,379 +1,287 @@
 import axios from "axios";
-import { load } from "cheerio";
+import * as cheerio from "cheerio";
+import { DEFAULT_PLAN_MRR, DEFAULT_SCAN_TIMEOUT_MS } from "@/lib/constants";
+import {
+  completeScanRun,
+  getTeamConnections,
+  insertScanResults,
+  markScanRunFailed,
+  type Provider,
+  type ScanResultInput
+} from "@/lib/database";
+import { fetchNetlifyDeployments } from "@/lib/netlify-client";
+import { fetchVercelDeployments } from "@/lib/vercel-client";
 
-import { initDb, query } from "@/lib/database";
-import { fetchNetlifyProjects } from "@/lib/netlify-api";
-import { decryptToken } from "@/lib/security";
-import { fetchVercelProjects } from "@/lib/vercel-api";
-
-type DbConnection = {
-  provider: "vercel" | "netlify";
-  encrypted_token: string;
-};
-
-type DbProject = {
-  id: string;
-  team_id: string;
-  provider: "vercel" | "netlify";
-  provider_project_id: string;
-  name: string;
-  framework: string | null;
-  url: string | null;
-};
-
-type ScanCheck = {
-  deploymentUrl: string;
-  statusCode: number | null;
-  gated: boolean;
-  gateReason: string;
-  pageTitle: string | null;
-  responseMs: number;
-  estimatedMonthlyVisitors: number;
-  estimatedLostCustomers: number;
-  estimatedMrrLossCents: number;
-};
-
-type ExternalProject = {
-  provider: "vercel" | "netlify";
-  providerProjectId: string;
-  name: string;
-  framework: string | null;
-  primaryUrl: string;
+type DeploymentTarget = {
+  provider: Provider;
+  projectName: string;
   deploymentUrl: string;
 };
 
-type ScanSummary = {
-  projectsScanned: number;
-  blockedCount: number;
-  estimatedLostCustomers: number;
-  estimatedMrrLossCents: number;
-};
+type ProbedResult = ScanResultInput;
 
-function normalizeUrl(input: string): string {
-  if (input.startsWith("http://") || input.startsWith("https://")) {
-    return input;
-  }
+const BLOCK_MARKERS = [
+  "401 unauthorized",
+  "authentication required",
+  "protected by password",
+  "vercel authentication",
+  "access denied",
+  "site password",
+  "password protected",
+  "please log in",
+  "sign in to continue"
+];
 
-  return `https://${input}`;
-}
+const REDIRECT_AUTH_MARKERS = [
+  "login",
+  "signin",
+  "auth",
+  "password",
+  "protected",
+  "saml",
+  "sso"
+];
 
-function estimateImpact(project: DbProject, gated: boolean): {
-  estimatedMonthlyVisitors: number;
-  estimatedLostCustomers: number;
-  estimatedMrrLossCents: number;
+function calculateImpact(deploymentUrl: string, isBlocked: boolean): {
+  visitors: number;
+  lostCustomers: number;
+  mrrLoss: number;
 } {
-  const entropy = `${project.name}:${project.provider_project_id}:${project.provider}`;
-  const score = entropy.split("").reduce((sum, char) => sum + char.charCodeAt(0), 0);
+  const seed = Array.from(deploymentUrl).reduce((sum, char) => sum + char.charCodeAt(0), 0);
+  const visitors = 120 + (seed % 2400);
 
-  const estimatedMonthlyVisitors = 120 + (score % 1400);
-  if (!gated) {
+  if (!isBlocked) {
     return {
-      estimatedMonthlyVisitors,
-      estimatedLostCustomers: 0,
-      estimatedMrrLossCents: 0
+      visitors,
+      lostCustomers: 0,
+      mrrLoss: 0
     };
   }
 
-  const estimatedLostCustomers = Math.max(1, Math.ceil(estimatedMonthlyVisitors * 0.032));
-  const estimatedMrrLossCents = estimatedLostCustomers * 4900;
+  const lostCustomers = Math.max(1, Math.round(visitors * 0.014));
+  const mrrLoss = Number((lostCustomers * DEFAULT_PLAN_MRR).toFixed(2));
 
   return {
-    estimatedMonthlyVisitors,
-    estimatedLostCustomers,
-    estimatedMrrLossCents
+    visitors,
+    lostCustomers,
+    mrrLoss
   };
 }
 
-function detectGate(statusCode: number | null, bodyText: string, headers: Record<string, string>): {
-  gated: boolean;
-  reason: string;
-} {
-  if (statusCode === 401 || statusCode === 403) {
-    return {
-      gated: true,
-      reason: `HTTP ${statusCode} returned`
-    };
+function detectGuardFromBody(html: string): string {
+  const lower = html.toLowerCase();
+
+  if (lower.includes("vercel authentication") || lower.includes("vercel sso")) {
+    return "vercel-protection";
   }
 
-  const hintPatterns = [
-    "password protected",
-    "authentication required",
-    "access denied",
-    "not authorized",
-    "restricted access",
-    "enter password",
-    "sso",
-    "login required"
-  ];
-
-  const hasKeyword = hintPatterns.some((pattern) => bodyText.includes(pattern));
-  const authHeader = headers["www-authenticate"];
-
-  if (authHeader) {
-    return {
-      gated: true,
-      reason: `Auth challenge header present (${authHeader})`
-    };
+  if (lower.includes("netlify") && lower.includes("password")) {
+    return "netlify-password-protection";
   }
 
-  if (hasKeyword && (statusCode === 200 || statusCode === 302)) {
-    return {
-      gated: true,
-      reason: "Auth wall content detected in response body"
-    };
+  if (lower.includes("basic realm") || lower.includes("www-authenticate")) {
+    return "basic-auth";
   }
 
-  return {
-    gated: false,
-    reason: "No auth gate detected"
-  };
+  if (lower.includes("cloudflare") && lower.includes("access")) {
+    return "cloudflare-access";
+  }
+
+  return "unknown";
 }
 
-async function checkDeployment(url: string, project: DbProject): Promise<ScanCheck> {
-  const startedAt = Date.now();
+async function runOptionalBrowserProbe(url: string): Promise<{ detectedGuard: string } | null> {
+  if (process.env.ENABLE_BROWSER_SCAN !== "1") {
+    return null;
+  }
+
+  const puppeteer = await import("puppeteer");
+  const browser = await puppeteer.default.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
 
   try {
-    const response = await axios.get<string>(normalizeUrl(url), {
-      timeout: 15_000,
+    const page = await browser.newPage();
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20_000 });
+    const content = await page.content();
+    return {
+      detectedGuard: detectGuardFromBody(content)
+    };
+  } finally {
+    await browser.close();
+  }
+}
+
+async function probeDeployment(target: DeploymentTarget): Promise<ProbedResult> {
+  const started = Date.now();
+  const timeout = Number(process.env.SCAN_REQUEST_TIMEOUT_MS ?? DEFAULT_SCAN_TIMEOUT_MS);
+
+  try {
+    const response = await axios.get<string>(target.deploymentUrl, {
+      timeout,
       maxRedirects: 5,
       validateStatus: () => true,
+      headers: {
+        "User-Agent": "SSO-Exposure-Scanner/1.0"
+      },
       responseType: "text"
     });
 
     const statusCode = response.status;
-    const responseMs = Date.now() - startedAt;
-    const body = typeof response.data === "string" ? response.data.toLowerCase() : "";
-    const headers: Record<string, string> = {};
+    const htmlBody = typeof response.data === "string" ? response.data : "";
+    const location = String(response.headers.location ?? "").toLowerCase();
 
-    Object.entries(response.headers).forEach(([key, value]) => {
-      headers[key.toLowerCase()] = Array.isArray(value) ? value.join(",") : String(value ?? "");
-    });
+    const $ = cheerio.load(htmlBody || "");
+    const title = $("title").text().trim().toLowerCase();
+    const mergedText = `${title} ${$.root().text().toLowerCase()}`;
 
-    const { gated, reason } = detectGate(statusCode, body, headers);
-    const $ = typeof response.data === "string" ? load(response.data) : null;
-    const title = $ ? $("title").first().text().trim() : "";
-    const impact = estimateImpact(project, gated);
+    const markerMatch = BLOCK_MARKERS.find((marker) => mergedText.includes(marker));
+    const redirectSignalsAuth =
+      (statusCode >= 300 && statusCode < 400) &&
+      REDIRECT_AUTH_MARKERS.some((marker) => location.includes(marker));
+
+    const blockedByStatus = statusCode === 401 || statusCode === 403;
+    const blockedByMarker = Boolean(markerMatch);
+    const isBlocked = blockedByStatus || blockedByMarker || redirectSignalsAuth;
+
+    let detectedGuard = detectGuardFromBody(htmlBody);
+
+    if (!isBlocked && detectedGuard === "unknown") {
+      const browserProbe = await runOptionalBrowserProbe(target.deploymentUrl);
+      if (browserProbe?.detectedGuard && browserProbe.detectedGuard !== "unknown") {
+        detectedGuard = browserProbe.detectedGuard;
+      }
+    }
+
+    const impact = calculateImpact(target.deploymentUrl, isBlocked);
 
     return {
-      deploymentUrl: normalizeUrl(url),
+      provider: target.provider,
+      projectName: target.projectName,
+      deploymentUrl: target.deploymentUrl,
       statusCode,
-      gated,
-      gateReason: reason,
-      pageTitle: title || null,
-      responseMs,
-      ...impact
+      isBlocked,
+      blockReason: blockedByStatus
+        ? `HTTP ${statusCode} returned`
+        : blockedByMarker
+          ? `Auth marker detected: ${markerMatch}`
+          : redirectSignalsAuth
+            ? "Redirects to authentication flow"
+            : "URL appears public",
+      detectedGuard,
+      estimatedMonthlyVisitors: impact.visitors,
+      estimatedLostCustomers: impact.lostCustomers,
+      estimatedMrrLoss: impact.mrrLoss,
+      responseTimeMs: Date.now() - started
     };
   } catch (error) {
-    const responseMs = Date.now() - startedAt;
-    const impact = estimateImpact(project, true);
+    const impact = calculateImpact(target.deploymentUrl, true);
 
     return {
-      deploymentUrl: normalizeUrl(url),
-      statusCode: null,
-      gated: true,
-      gateReason: error instanceof Error ? `Request failed: ${error.message}` : "Request failed",
-      pageTitle: null,
-      responseMs,
-      ...impact
+      provider: target.provider,
+      projectName: target.projectName,
+      deploymentUrl: target.deploymentUrl,
+      statusCode: 0,
+      isBlocked: true,
+      blockReason:
+        error instanceof Error
+          ? `Request failed: ${error.message}`
+          : "Request failed due to unknown network error",
+      detectedGuard: "unknown",
+      estimatedMonthlyVisitors: impact.visitors,
+      estimatedLostCustomers: impact.lostCustomers,
+      estimatedMrrLoss: impact.mrrLoss,
+      responseTimeMs: Date.now() - started
     };
   }
 }
 
-async function getTeamConnections(teamId: string): Promise<DbConnection[]> {
-  const result = await query<DbConnection>(
-    `
-      SELECT provider, encrypted_token
-      FROM oauth_connections
-      WHERE team_id = $1
-    `,
-    [teamId]
-  );
+function uniqueTargets(targets: DeploymentTarget[]): DeploymentTarget[] {
+  const seen = new Set<string>();
+  const deduped: DeploymentTarget[] = [];
 
-  return result.rows;
-}
+  for (const target of targets) {
+    const normalizedUrl = target.deploymentUrl.replace(/\/$/, "");
+    const key = `${target.provider}:${normalizedUrl}`;
 
-async function upsertProject(teamId: string, external: ExternalProject): Promise<DbProject> {
-  const id = crypto.randomUUID();
-
-  const result = await query<DbProject>(
-    `
-      INSERT INTO projects (
-        id,
-        team_id,
-        provider,
-        provider_project_id,
-        name,
-        framework,
-        url,
-        updated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-      ON CONFLICT (team_id, provider, provider_project_id)
-      DO UPDATE SET
-        name = EXCLUDED.name,
-        framework = EXCLUDED.framework,
-        url = EXCLUDED.url,
-        updated_at = NOW()
-      RETURNING id, team_id, provider, provider_project_id, name, framework, url
-    `,
-    [
-      id,
-      teamId,
-      external.provider,
-      external.providerProjectId,
-      external.name,
-      external.framework,
-      external.primaryUrl
-    ]
-  );
-
-  return result.rows[0];
-}
-
-async function fetchConnectedProjects(connections: DbConnection[]): Promise<ExternalProject[]> {
-  const projects: ExternalProject[] = [];
-
-  for (const connection of connections) {
-    const token = decryptToken(connection.encrypted_token);
-
-    if (connection.provider === "vercel") {
-      const vercelProjects = await fetchVercelProjects(token);
-      projects.push(...vercelProjects);
+    if (seen.has(key)) {
       continue;
     }
 
-    const netlifyProjects = await fetchNetlifyProjects(token);
-    projects.push(...netlifyProjects);
+    seen.add(key);
+    deduped.push({ ...target, deploymentUrl: normalizedUrl });
   }
 
-  return projects;
+  return deduped;
 }
 
-function summarize(results: ScanCheck[]): ScanSummary {
-  return results.reduce<ScanSummary>(
-    (acc, row) => {
-      acc.projectsScanned += 1;
-      if (row.gated) {
-        acc.blockedCount += 1;
-        acc.estimatedLostCustomers += row.estimatedLostCustomers;
-        acc.estimatedMrrLossCents += row.estimatedMrrLossCents;
+async function mapWithConcurrency<TInput, TOutput>(
+  inputs: TInput[],
+  concurrency: number,
+  mapper: (input: TInput) => Promise<TOutput>
+): Promise<TOutput[]> {
+  const output: TOutput[] = new Array(inputs.length);
+  let cursor = 0;
+
+  async function worker(): Promise<void> {
+    while (true) {
+      const current = cursor;
+      cursor += 1;
+
+      if (current >= inputs.length) {
+        return;
       }
-      return acc;
-    },
-    {
-      projectsScanned: 0,
-      blockedCount: 0,
-      estimatedLostCustomers: 0,
-      estimatedMrrLossCents: 0
+
+      output[current] = await mapper(inputs[current]);
     }
-  );
-}
-
-export type TeamScanResult = {
-  scanId: string;
-  summary: ScanSummary;
-  results: Array<ScanCheck & { projectId: string }>;
-};
-
-export async function scanTeam(teamId: string): Promise<TeamScanResult> {
-  await initDb();
-
-  const connections = await getTeamConnections(teamId);
-  if (connections.length === 0) {
-    throw new Error("No Vercel or Netlify accounts are connected.");
   }
 
-  const scanId = crypto.randomUUID();
-  await query(
-    `
-      INSERT INTO scans (id, team_id, status, started_at)
-      VALUES ($1, $2, 'running', NOW())
-    `,
-    [scanId, teamId]
-  );
+  const workers = Array.from({ length: Math.max(1, concurrency) }, () => worker());
+  await Promise.all(workers);
+  return output;
+}
 
+export async function runDeploymentScan(teamId: string, runId: string): Promise<void> {
   try {
-    const externalProjects = await fetchConnectedProjects(connections);
+    const connections = await getTeamConnections(teamId);
 
-    const scanRows: Array<ScanCheck & { projectId: string }> = [];
+    const targets: DeploymentTarget[] = [];
 
-    for (const externalProject of externalProjects) {
-      const project = await upsertProject(teamId, externalProject);
-      const check = await checkDeployment(externalProject.deploymentUrl, project);
-
-      scanRows.push({
-        ...check,
-        projectId: project.id
-      });
-
-      await query(
-        `
-          INSERT INTO scan_results (
-            id,
-            scan_id,
-            project_id,
-            deployment_url,
-            status_code,
-            gated,
-            gate_reason,
-            page_title,
-            response_ms,
-            estimated_monthly_visitors,
-            estimated_lost_customers,
-            estimated_mrr_loss_cents,
-            created_at
-          ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW()
-          )
-        `,
-        [
-          crypto.randomUUID(),
-          scanId,
-          project.id,
-          check.deploymentUrl,
-          check.statusCode,
-          check.gated,
-          check.gateReason,
-          check.pageTitle,
-          check.responseMs,
-          check.estimatedMonthlyVisitors,
-          check.estimatedLostCustomers,
-          check.estimatedMrrLossCents
-        ]
-      );
+    if (connections.vercelAccessToken) {
+      const vercelTargets = await fetchVercelDeployments(connections.vercelAccessToken);
+      targets.push(...vercelTargets);
     }
 
-    const summary = summarize(scanRows);
+    if (connections.netlifyAccessToken) {
+      const netlifyTargets = await fetchNetlifyDeployments(connections.netlifyAccessToken);
+      targets.push(...netlifyTargets);
+    }
 
-    await query(
-      `
-        UPDATE scans
-        SET
-          status = 'completed',
-          finished_at = NOW(),
-          summary = $2::jsonb
-        WHERE id = $1
-      `,
-      [scanId, JSON.stringify(summary)]
+    const dedupedTargets = uniqueTargets(targets);
+
+    const results = await mapWithConcurrency(
+      dedupedTargets,
+      4,
+      async (target) => probeDeployment(target)
     );
 
-    return {
-      scanId,
-      summary,
-      results: scanRows
-    };
+    await insertScanResults(runId, teamId, results);
+
+    const blockedUrls = results.filter((result) => result.isBlocked).length;
+    const estimatedMonthlyMrrLoss = results.reduce(
+      (sum, result) => sum + result.estimatedMrrLoss,
+      0
+    );
+
+    await completeScanRun(
+      runId,
+      results.length,
+      blockedUrls,
+      Number(estimatedMonthlyMrrLoss.toFixed(2))
+    );
   } catch (error) {
-    await query(
-      `
-        UPDATE scans
-        SET
-          status = 'failed',
-          finished_at = NOW(),
-          summary = jsonb_build_object('error', $2)
-        WHERE id = $1
-      `,
-      [scanId, error instanceof Error ? error.message : "Unknown scan error"]
-    );
-
+    await markScanRunFailed(runId);
     throw error;
   }
 }

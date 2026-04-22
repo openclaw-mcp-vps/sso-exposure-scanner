@@ -1,93 +1,50 @@
-import { randomBytes } from "crypto";
-
+import { randomUUID } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
+import { getAbsoluteAppUrl, getTeamIdFromCookie } from "@/lib/auth";
+import { cleanupStaleOAuthStates, consumeOAuthState, saveOAuthState, saveProviderToken } from "@/lib/database";
+import { exchangeNetlifyCodeForToken, getNetlifyAuthUrl } from "@/lib/netlify-client";
 
-import { initDb, query } from "@/lib/database";
-import { buildNetlifyOAuthUrl, exchangeNetlifyCode } from "@/lib/netlify-api";
-import { encryptToken } from "@/lib/security";
-import { TEAM_COOKIE } from "@/lib/session";
-
-const OAUTH_STATE_COOKIE = "netlify_oauth_state";
+function dashboardRedirect(search: string): NextResponse {
+  return NextResponse.redirect(new URL(`/dashboard${search}`, getAbsoluteAppUrl()));
+}
 
 export async function GET(request: NextRequest): Promise<NextResponse> {
-  await initDb();
+  const { searchParams } = request.nextUrl;
+  const code = searchParams.get("code");
+  const state = searchParams.get("state");
+  const error = searchParams.get("error");
 
-  const code = request.nextUrl.searchParams.get("code");
-  const state = request.nextUrl.searchParams.get("state");
-  const teamId = request.cookies.get(TEAM_COOKIE)?.value ?? crypto.randomUUID();
-  const redirectUri = `${request.nextUrl.origin}/api/auth/netlify`;
+  await cleanupStaleOAuthStates();
+
+  if (error) {
+    return dashboardRedirect(`?netlify=error&reason=${encodeURIComponent(error)}`);
+  }
 
   if (!code) {
-    const oauthState = randomBytes(20).toString("hex");
-    const authorizeUrl = buildNetlifyOAuthUrl(oauthState, redirectUri);
-    const response = NextResponse.redirect(authorizeUrl);
+    const teamId = await getTeamIdFromCookie();
+    const generatedState = randomUUID();
 
-    response.cookies.set(OAUTH_STATE_COOKIE, oauthState, {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: process.env.NODE_ENV === "production",
-      path: "/",
-      maxAge: 60 * 10
-    });
+    await saveOAuthState(generatedState, teamId, "netlify");
 
-    response.cookies.set(TEAM_COOKIE, teamId, {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: process.env.NODE_ENV === "production",
-      path: "/",
-      maxAge: 60 * 60 * 24 * 365
-    });
-
-    return response;
+    return NextResponse.redirect(getNetlifyAuthUrl(generatedState));
   }
 
-  const storedState = request.cookies.get(OAUTH_STATE_COOKIE)?.value;
-  if (!state || !storedState || state !== storedState) {
-    return NextResponse.json({ error: "Invalid OAuth state." }, { status: 400 });
+  if (!state) {
+    return dashboardRedirect("?netlify=error&reason=missing_state");
   }
 
-  const tokenResponse = await exchangeNetlifyCode(code, redirectUri);
+  const teamId = await consumeOAuthState(state, "netlify");
 
-  await query(
-    `
-      INSERT INTO oauth_connections (
-        id,
-        team_id,
-        provider,
-        encrypted_token,
-        account_name,
-        scope,
-        created_at,
-        updated_at
-      ) VALUES ($1, $2, 'netlify', $3, $4, $5, NOW(), NOW())
-      ON CONFLICT (team_id, provider)
-      DO UPDATE SET
-        encrypted_token = EXCLUDED.encrypted_token,
-        account_name = EXCLUDED.account_name,
-        scope = EXCLUDED.scope,
-        updated_at = NOW()
-    `,
-    [
-      crypto.randomUUID(),
-      teamId,
-      encryptToken(tokenResponse.accessToken),
-      "Connected Netlify account",
-      tokenResponse.scope
-    ]
-  );
+  if (!teamId) {
+    return dashboardRedirect("?netlify=error&reason=invalid_state");
+  }
 
-  const redirectUrl = new URL("/dashboard", request.nextUrl.origin);
-  redirectUrl.searchParams.set("connected", "netlify");
-  const response = NextResponse.redirect(redirectUrl);
-
-  response.cookies.delete(OAUTH_STATE_COOKIE);
-  response.cookies.set(TEAM_COOKIE, teamId, {
-    httpOnly: true,
-    sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
-    path: "/",
-    maxAge: 60 * 60 * 24 * 365
-  });
-
-  return response;
+  try {
+    const accessToken = await exchangeNetlifyCodeForToken(code);
+    await saveProviderToken(teamId, "netlify", accessToken);
+    return dashboardRedirect("?netlify=connected");
+  } catch (exchangeError) {
+    console.error("Netlify OAuth exchange failed", exchangeError);
+    return dashboardRedirect("?netlify=error&reason=oauth_exchange_failed");
+  }
 }
